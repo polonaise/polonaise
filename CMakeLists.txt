@@ -5,6 +5,17 @@ if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Build options
+option(ENABLE_EXAMPLE_FUSE "Build client which uses libfuse" ON)
+message(STATUS "Build options - begin")
+message(STATUS "ENABLE_EXAMPLE_FUSE ${ENABLE_EXAMPLE_FUSE}")
+message(STATUS "Build options - end")
+
+# Option ENABLE_EXAMPLE_FUSE
+if (ENABLE_EXAMPLE_FUSE)
+	set(BUILD_EXAMPLE_FUSE ON)
+endif()
+
 # Version of the library
 set(POLONAISE_MAJOR_VERSION 0)
 set(POLONAISE_MINOR_VERSION 1)
