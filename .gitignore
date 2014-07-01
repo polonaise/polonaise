@@ -1,0 +1,28 @@
+*~
+.DS_Store
+
+# Vim files #
+#############
+.clang_complete
+tags
+*.taghl
+compile_commands.json
+.ycm_extra_conf.py
+
+# Commonly used build directory #
+#################################
+/build*
+
+# Eclipse project files #
+#########################
+/.project
+/.cproject
+/.settings
+
+# KDevelop4 project file #
+##########################
+*.kdev4
+
+# QtCreator user profiles #
+###########################
+*.user
