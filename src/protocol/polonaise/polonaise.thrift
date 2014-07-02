@@ -122,43 +122,59 @@ struct AttributesReply {
 	2: required double     attributesTimeout
 }
 
-struct ReadDirReply {
+struct DirectoryEntry {
 	1: required string     name
 	2: required FileStat   attributes
-	3: required i64        offset
-	4: required i64        size
+	3: required i64        nextEntryOffset
 }
 
 service Polonaise
 {
 	SessionId initSession() throws (1: Failure failure)
 
+	# Converts (<parent_inode>, <file_name>) into (<child_inode>, <child_attributes>).
 	EntryReply lookup(
 			1: Context context,
 			2: Inode inode,
 			3: string name)
 			throws (1: Status status, 2: Failure failure)
 
+	# Given inode, returns attributes of the file.
+	# 'descriptor' is optional and should be provided if the file is opened by the callee,
+	# otherise kNullDescriptor should be used.
 	AttributesReply getattr(
 			1: Context context,
 			2: Inode inode,
 			3: Descriptor descriptor)
 			throws (1: Status status, 2: Failure failure)
 
-	OpenReply opendir(
+
+	# Opens a directory.
+	# Returns descriptor which should be used in forthcoming 'readdir' and 'releasedir' calls.
+	Descriptor opendir(
 			1: Context context,
-			2: Inode inode,
-			3: i32 flags)
+			2: Inode inode)
 			throws (1: Status status, 2: Failure failure)
 
-	list<ReadDirReply> readdir(
+	# Gets entries from a directory.
+	# The directory has to be opened and descriptor returned by 'opendir' has to be provided.
+	# 'maxNumberOfEntries' is the maximum number of entries returned by this call. If the call
+	# returns less, this indicated that there are no more entries.
+	# In the first call use 'firstEntryOffset' == 0. If readdir returns exactly
+	# 'maxNumberOfEntries' entries, it indicated that there may be more entries present. To fetch
+	# them, call readdir once again using 'firstEntryOffset' equal to 'entry.nextEntryOffset'
+	# from the last entry returned by the previous call. Exact meaning of the 'firstEntryOffset'
+	# and 'entry.nextEntryOffset' is implementation specific.
+	list<DirectoryEntry> readdir(
 			1: Context context,
 			2: Inode inode,
-			3: i64 offset,
-			4: i64 size,
+			3: i64 firstEntryOffset,
+			4: i64 maxNumberOfEntries,
 			5: Descriptor descriptor)
 			throws (1: Status status, 2: Failure failure)
 
+	# Closes a directory.
+	# The directory has to be opened and descriptor returned by 'opendir' has to be provided.
 	void releasedir(
 			1: Context context,
 			2: Inode inode,
