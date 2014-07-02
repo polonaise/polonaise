@@ -1,0 +1,14 @@
+# - Config file for the Poloniase package
+# It defines the following variables
+#  POLONAISE_INCLUDE_DIRS - include directories for Polonaise
+#  POLONAISE_LIBRARIES    - libraries to link against
+#  POLONAISE_FOUND        - set to true
+
+# Our library dependencies (contains definitions for IMPORTED targets)
+get_filename_component(POLONAISE_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
+include("${POLONAISE_CMAKE_DIR}/PolonaiseTargets.cmake")
+
+# polonaise is an IMPORTED target created by PolonaiseTargets.cmake
+set(POLONAISE_LIBRARIES polonaise)
+set(POLONAISE_INCLUDE_DIRS "@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_INCLUDEDIR@")
+set(POLONAISE_FOUND TRUE)

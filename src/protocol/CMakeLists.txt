@@ -18,11 +18,22 @@ add_custom_command(
 	COMMENT "Generating sources using Thrift compiler"
 	DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/polonaise/polonaise.thrift)
 
+# version.h file
+configure_file(version.h.in "${CMAKE_CURRENT_BINARY_DIR}/version.h")
+
 # The polonaise library
 include_directories(${GENERATED_CODE})
 include_directories(${THRIFT_INCLUDE_DIRS})
 add_library(polonaise STATIC ${POLONAISE_SOURCES})
+target_link_libraries(polonaise ${THRIFT_LIBRARIES})
+set_target_properties(polonaise PROPERTIES
+	PUBLIC_HEADER "${POLONAISE_HEADERS};${CMAKE_CURRENT_BINARY_DIR}/version.h"
+	OUTPUT_NAME_RELEASE poloniase
+	OUTPUT_NAME_DEBUG   poloniase-dbg)
 
 # Installation instructions
-install(FILES ${POLONAISE_HEADERS} DESTINATION include/polonaise)
-install(TARGETS polonaise DESTINATION lib)
+install(TARGETS polonaise
+	EXPORT PolonaiseTargets
+	LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+	ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+	PUBLIC_HEADER DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/polonaise")
