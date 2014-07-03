@@ -8,11 +8,11 @@
 #     THRIFT_COMPILER
 
 # Dependencies:
-if (NOT Boost_FOUND)
+if (NOT Boost_INCLUDE_DIRS)
 	if(Thrift_FIND_REQUIRED)
-		message(FATAL_ERROR "Thrift requires Boost to be found")
+		message(FATAL_ERROR "Thrift requires Boost headers")
 	elseif(NOT Thrift_FIND_QUIETLY)
-		message(STATUS "Thrift requires Boost to be found")
+		message(STATUS "Thrift requires Boost headers")
 	endif()
 	return()
 endif()
