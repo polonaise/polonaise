@@ -68,6 +68,12 @@ enum OpenFlags {
 	kAppend = 32,
 }
 
+enum AccessMask {
+	kExecute = 1,
+	kWrite = 2,
+	kRead = 4
+}
+
 exception Failure {
 	1: required string message
 }
@@ -120,6 +126,18 @@ struct EntryReply {
 struct AttributesReply {
 	1: required FileStat   attributes
 	2: required double     attributesTimeout
+}
+
+struct StatFsReply {
+	1: required i64        filesystemId
+	2: required i64        maxNameLength
+	3: required i64        blockSize
+	4: required i64        totalBlocks
+	5: required i64        freeBlocks
+	6: required i64        availableBlocks
+	7: required i64        totalFiles
+	8: required i64        freeFiles
+	9: required i64        availableFiles
 }
 
 struct DirectoryEntry {
@@ -179,5 +197,56 @@ service Polonaise
 			1: Context context,
 			2: Inode inode,
 			3: Descriptor descriptor)
+			throws (1: Status status, 2: Failure failure)
+
+	# Checks access rights.
+	# Throws if the access is not possible.
+	# 'mask' is a bitwise alternative of values from the AccessMask enum.
+	void access(
+			1: Context context,
+			2: Inode inode,
+			3: i32 mask)
+			throws (1: Status status, 2: Failure failure)
+
+	# Opens a file.
+	# 'flags' is a bitwise alternative of values from the OpenFlags enum.
+	OpenReply open(
+			1: Context context,
+			2: Inode inode,
+			3: i32 flags)
+			throws (1: Status status, 2: Failure failure)
+
+	# Gets data from an opened file.
+	# The file has to be opened and descriptor returned by 'open' has to be provided.
+	binary read(
+			1: Context context,
+			2: Inode inode,
+			3: i64 offset,
+			4: i64 size,
+			5: Descriptor descriptor)
+			throws (1: Status status, 2: Failure failure)
+
+	# Flushes a file.
+	# This has to be called each time when any copy of a descriptor
+	# returned by 'open' is going to be closed.
+	void flush(
+			1: Context context,
+			2: Inode inode,
+			3: Descriptor descriptor)
+			throws (1: Status status, 2: Failure failure)
+
+	# Deletes a descriptor.
+	# This should be called when the last copy of a descriptor returned by 'open' is closed.
+	# Never throws the 'Status' exception.
+	void release(
+			1: Context context,
+			2: Inode inode,
+			3: Descriptor descriptor)
+			throws (2: Failure failure)
+
+	# Returns information about the filesystem.
+	StatFsReply statfs(
+			1: Context context,
+			2: Inode inode)
 			throws (1: Status status, 2: Failure failure)
 }
