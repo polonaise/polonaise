@@ -122,6 +122,17 @@ int get_access_mask(int posixMask) {
 
 // Polonaise to FUSE conversions
 
+int make_mode(const Mode& mode) {
+	int ret = 0;
+	ret |= (get_access_mask(mode.otherMask) << 0);
+	ret |= (get_access_mask(mode.groupMask) << 3);
+	ret |= (get_access_mask(mode.ownerMask) << 6);
+	ret |= (mode.sticky ? S_ISVTX : 0);
+	ret |= (mode.setUid ? S_ISUID : 0);
+	ret |= (mode.setGid ? S_ISGID : 0);
+	return ret;
+}
+
 struct stat make_stbuf(const FileStat& fs) {
 	struct stat stbuf{};
 	switch (fs.type) {
@@ -150,7 +161,7 @@ struct stat make_stbuf(const FileStat& fs) {
 	stbuf.st_dev = fs.dev;
 	stbuf.st_ino = fs.inode;
 	stbuf.st_nlink = fs.nlink;
-	stbuf.st_mode |= fs.mode & 07777;
+	stbuf.st_mode |= make_mode(fs.mode);
 	stbuf.st_uid = fs.uid;
 	stbuf.st_gid = fs.gid;
 	stbuf.st_rdev = fs.rdev;
