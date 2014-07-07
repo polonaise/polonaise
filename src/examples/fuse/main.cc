@@ -22,17 +22,14 @@
 #include <sys/time.h>
 
 #include <boost/make_shared.hpp>
-
 #include <fuse.h>
 #include <fuse/fuse_lowlevel.h>
 #include <fuse/fuse_opt.h>
-
+#include <polonaise/Polonaise.h>
+#include <polonaise/polonaise_constants.h>
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/transport/TSocket.h>
 #include <thrift/transport/TTransportUtils.h>
-
-#include <polonaise/Polonaise.h>
-#include <polonaise/polonaise_constants.h>
 
 using namespace polonaise;
 
@@ -48,9 +45,9 @@ bool polonaise_init() {
 	using namespace apache::thrift::transport;
 
 	try {
-		boost::shared_ptr<TTransport> socket(new TSocket(gHostname, gPort));
-		gThriftTransport = boost::make_shared<TBufferedTransport>(socket);
-		boost::shared_ptr<TProtocol> protocol(new TBinaryProtocol(gThriftTransport));
+		auto socket = boost::make_shared<TSocket>(gHostname, gPort);
+		gThriftTransport = TBufferedTransportFactory().getTransport(socket);
+		auto protocol = TBinaryProtocolFactory().getProtocol(gThriftTransport);
 		gPolonaiseClient = boost::make_shared<PolonaiseClient>(protocol);
 		gThriftTransport->open();
 		gSessionId = gPolonaiseClient->initSession();
@@ -126,6 +123,44 @@ int get_access_mask(int posixMask) {
 		}
 	}
 	return polonaiseMask;
+}
+
+Mode get_mode(int posixMode) {
+	Mode result;
+	result.ownerMask = get_access_mask((posixMode >> 6) & 07);
+	result.groupMask = get_access_mask((posixMode >> 3) & 07);
+	result.otherMask = get_access_mask((posixMode >> 0) & 07);
+	result.sticky = (posixMode & S_ISVTX);
+	result.setUid = (posixMode & S_ISUID);
+	result.setGid = (posixMode & S_ISGID);
+	return result;
+}
+
+FileType::type get_file_type(int posixMode) {
+	if (S_ISREG(posixMode)) {
+		return FileType::kRegular;
+	}
+	if (S_ISDIR(posixMode)) {
+		return FileType::kDirectory;
+	}
+	if (S_ISLNK(posixMode)) {
+		return FileType::kSymlink;
+	}
+	if (S_ISFIFO(posixMode)) {
+		return FileType::kFifo;
+	}
+	if (S_ISBLK(posixMode)) {
+		return FileType::kBlockDevice;
+	}
+	if (S_ISCHR(posixMode)) {
+		return FileType::kCharDevice;
+	}
+	if (S_ISSOCK(posixMode)) {
+		return FileType::kSocket;
+	}
+	Failure failure;
+	failure.message = "client: Unknown file type in get_file_type";
+	throw failure;
 }
 
 // Polonaise to FUSE conversions
@@ -247,13 +282,17 @@ int make_error_number(StatusCode::type status) {
 	} catch (Status& s) { \
 		fuse_reply_err(req, make_error_number(s.statusCode)); \
 	} catch (Failure& f) { \
-		fprintf(stderr, "failure: %s\n", f.message.c_str()); \
+		fprintf(stderr, "(%s) failure: %s\n", __FUNCTION__, f.message.c_str()); \
 		fuse_reply_err(req, EIO); \
 	} catch (apache::thrift::TException& e) { \
-		fprintf(stderr, "connection error: %s\n", e.what()); \
+		fprintf(stderr, "(%s) connection error: %s\n", __FUNCTION__, e.what()); \
 		fuse_reply_err(req, EIO); \
 		polonaise_init(); \
 	}
+
+void do_init(void *userdata, struct fuse_conn_info *conn) {
+	conn->want |= FUSE_CAP_DONT_MASK;
+}
 
 void do_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
@@ -398,6 +437,151 @@ void do_statfs(fuse_req_t req, fuse_ino_t ino) {
 	HANDLE_POLONAISE_EXCEPTION_END
 }
 
+void do_symlink(fuse_req_t req, const char *link, fuse_ino_t parent, const char *name) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	EntryReply reply;
+	gPolonaiseClient->symlink(reply, get_context(req), link, parent, name);
+	const fuse_entry_param fep = make_fuse_entry_param(reply);
+	fuse_reply_entry(req, &fep);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_readlink(fuse_req_t req, fuse_ino_t ino) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	std::string reply;
+	gPolonaiseClient->readlink(reply, get_context(req), ino);
+	fuse_reply_readlink(req, reply.c_str());
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	std::string data(buf, size);
+	int64_t count = gPolonaiseClient->write(get_context(req), ino, off, size, data, get_descriptor(fi));
+	fuse_reply_write(req, count);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	gPolonaiseClient->fsync(get_context(req), ino, datasync, get_descriptor(fi));
+	fuse_reply_err(req, 0);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, struct fuse_file_info *fi) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	int32_t toSet = 0;
+	toSet |= (to_set & FUSE_SET_ATTR_MODE)      ? ToSet::kMode     : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_UID)       ? ToSet::kUid      : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_GID)       ? ToSet::kGid      : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_SIZE)      ? ToSet::kSize     : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_ATIME)     ? ToSet::kAtime    : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_MTIME)     ? ToSet::kMtime    : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_ATIME_NOW) ? ToSet::kAtimeNow : 0;
+	toSet |= (to_set & FUSE_SET_ATTR_MTIME_NOW) ? ToSet::kMtimeNow : 0;
+
+	FileStat attributes;
+	attributes.type = FileType::kFifo; // anything, server has to ignore it anyway
+	if (toSet & ToSet::kMode) {
+		attributes.mode = get_mode(attr->st_mode);
+	}
+	attributes.uid = (toSet & ToSet::kUid) ? attr->st_uid : 0;
+	attributes.gid = (toSet & ToSet::kGid) ? attr->st_gid : 0;
+	attributes.size = (toSet & ToSet::kSize) ? attr->st_size : 0;
+	attributes.atime = (toSet & ToSet::kAtime) ? attr->st_atime : 0;
+	attributes.mtime = (toSet & ToSet::kMtime) ? attr->st_mtime : 0;
+
+	AttributesReply reply;
+	gPolonaiseClient->setattr(reply, get_context(req), ino, attributes, toSet, get_descriptor(fi));
+	const struct stat stbuf = make_stbuf(reply.attributes);
+	fuse_reply_attr(req, &stbuf, reply.attributesTimeout);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	CreateReply reply;
+	gPolonaiseClient->create(reply, get_context(req), parent, name, get_mode(mode), get_open_flags(fi->flags));
+	const fuse_entry_param fep = make_fuse_entry_param(reply.entry);
+	fi->fh = static_cast<uint64_t>(reply.descriptor);
+	fi->direct_io = reply.directIo;
+	fi->keep_cache = reply.keepCache;
+	fuse_reply_create(req, &fep, fi);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	EntryReply reply;
+	gPolonaiseClient->mknod(reply, get_context(req), parent, name, get_file_type(mode), get_mode(mode), rdev);
+	const fuse_entry_param fep = make_fuse_entry_param(reply);
+	fuse_reply_entry(req, &fep);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	EntryReply reply;
+	gPolonaiseClient->mkdir(reply, get_context(req), parent, name, FileType::kDirectory, get_mode(mode));
+	const fuse_entry_param fep = make_fuse_entry_param(reply);
+	fuse_reply_entry(req, &fep);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	gPolonaiseClient->rmdir(get_context(req), parent, name);
+	fuse_reply_err(req, 0);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newname) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	EntryReply reply;
+	gPolonaiseClient->link(reply, get_context(req), ino, newparent, newname);
+	const fuse_entry_param fep = make_fuse_entry_param(reply);
+	fuse_reply_entry(req, &fep);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	gPolonaiseClient->unlink(get_context(req), parent, name);
+	fuse_reply_err(req, 0);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
+
+void do_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent, const char *newname) {
+	HANDLE_POLONAISE_EXCEPTION_BEGIN
+
+	gPolonaiseClient->rename(get_context(req), parent, name, newparent, newname);
+	fuse_reply_err(req, 0);
+
+	HANDLE_POLONAISE_EXCEPTION_END
+}
 
 int main(int argc, char** argv) {
 	gHostname = (getenv("POLONAISE_SERVER") ? getenv("POLONAISE_SERVER") : "localhost");
@@ -407,6 +591,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	struct fuse_lowlevel_ops ops{};
+	ops.init = do_init;
 	ops.getattr = do_getattr;
 	ops.opendir = do_opendir;
 	ops.readdir = do_readdir;
@@ -418,6 +603,18 @@ int main(int argc, char** argv) {
 	ops.flush = do_flush;
 	ops.release = do_release;
 	ops.statfs = do_statfs;
+	ops.symlink = do_symlink;
+	ops.readlink = do_readlink;
+	ops.write = do_write;
+	ops.fsync = do_fsync;
+	ops.setattr = do_setattr;
+	ops.create = do_create;
+	ops.mknod = do_mknod;
+	ops.mkdir = do_mkdir;
+	ops.rmdir = do_rmdir;
+	ops.link = do_link;
+	ops.unlink = do_unlink;
+	ops.rename = do_rename;
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	char *mp;
 	if (fuse_parse_cmdline(&args, &mp, NULL, NULL) < 0) {

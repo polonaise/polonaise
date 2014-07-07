@@ -277,6 +277,7 @@ service Polonaise
 			throws (1: Status status, 2: Failure failure)
 
 	# Creates a symbolic link.
+	# 'path' is the content of the symlink, 'name' is the name of the link.
 	EntryReply symlink(
 			1: Context context,
 			2: string path,
@@ -284,14 +285,16 @@ service Polonaise
 			4: string name)
 			throws (1: Status status, 2: Failure failure)
 
-	# Reads a symbolic link.
+	# Reads contents of a symbolic link.
 	string readlink(
 			1: Context context,
 			2: Inode inode)
 			throws (1: Status status, 2: Failure failure)
 
-	# Writes to a file.
+	# Writes data to a file.
 	# The file has to be opened and descriptor returned by 'open' has to be provided.
+	# Overwrites the file or possibly extends its size if (offset + size) is beyound
+	# the current end of the file.
 	i64 write(
 			1: Context context,
 			2: Inode inode,
@@ -311,6 +314,8 @@ service Polonaise
 			throws (1: Status status, 2: Failure failure)
 
 	# Sets attributes listed in 'toSet' from 'attributes'.
+	# Descriptor may be null, but it has to be provided if caller sets attributes using an open
+	# descriptor (eg. like in POSIX ftruncate).
 	AttributesReply setattr(
 			1: Context context,
 			2: Inode inode,
@@ -319,7 +324,7 @@ service Polonaise
 			5: Descriptor descriptor)
 			throws (1: Status status, 2: Failure failure)
 
-	# Creates a regular file.
+	# Creates and opens a regular file.
 	CreateReply create(
 			1: Context context,
 			2: Inode parent,
@@ -328,7 +333,7 @@ service Polonaise
 			5: i32 flags)
 			throws (1: Status status, 2: Failure failure)
 
-	# Creates a special file.
+	# Creates a special file (fifo, socket, etc.)
 	EntryReply mknod(
 			1: Context context,
 			2: Inode parent,
@@ -362,7 +367,8 @@ service Polonaise
 			4: string newName)
 			throws (1: Status status, 2: Failure failure)
 
-	# Removes a hardlink (and possibly the associated file).
+	# Removes a hardlink.
+	# Possibly removes also the associated file if it was the last link.
 	void unlink(
 			1: Context context,
 			2: Inode parent,
