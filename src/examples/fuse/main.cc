@@ -88,9 +88,6 @@ Context get_context(fuse_req_t& req) {
 
 int get_open_flags(int posixFlags) {
 	static std::pair<int, int> mappings[] = {
-			{O_RDWR,   OpenFlags::kRead |  OpenFlags::kWrite},
-			{O_RDONLY, OpenFlags::kRead},
-			{O_WRONLY, OpenFlags::kWrite},
 			{O_CREAT,  OpenFlags::kCreate},
 			{O_EXCL,   OpenFlags::kExclusive},
 			{O_APPEND, OpenFlags::kAppend},
@@ -101,6 +98,17 @@ int get_open_flags(int posixFlags) {
 		if (posixFlags & mapping.first) {
 			polonaiseFlags |= mapping.second;
 		}
+	}
+	switch (posixFlags & O_ACCMODE) {
+		case O_RDONLY:
+			polonaiseFlags |= OpenFlags::kRead;
+			break;
+		case O_WRONLY:
+			polonaiseFlags |= OpenFlags::kWrite;
+			break;
+		case O_RDWR:
+			polonaiseFlags |= (OpenFlags::kRead | OpenFlags::kWrite);
+			break;
 	}
 	return polonaiseFlags;
 }
