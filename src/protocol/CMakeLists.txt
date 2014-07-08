@@ -28,8 +28,8 @@ add_library(polonaise STATIC ${POLONAISE_SOURCES})
 target_link_libraries(polonaise ${THRIFT_LIBRARIES})
 set_target_properties(polonaise PROPERTIES
 	PUBLIC_HEADER "${POLONAISE_HEADERS};${CMAKE_CURRENT_BINARY_DIR}/version.h"
-	OUTPUT_NAME_RELEASE poloniase
-	OUTPUT_NAME_DEBUG   poloniase-dbg)
+	OUTPUT_NAME_RELEASE polonaise
+	OUTPUT_NAME_DEBUG   polonaise-dbg)
 
 # Installation instructions
 install(TARGETS polonaise
