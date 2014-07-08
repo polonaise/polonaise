@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <memory>
+#include <mutex>
 
 #include <boost/make_shared.hpp>
 #include <fuse.h>
@@ -33,37 +35,112 @@
 
 using namespace polonaise;
 
-static std::string gHostname;
-static int gPort;
-static boost::shared_ptr<apache::thrift::transport::TTransport> gThriftTransport;
-static boost::shared_ptr<PolonaiseClient> gPolonaiseClient;
+// A pool of Thrift Clients (ie. a pool of connections with some server)
+template <typename Client>
+class ThriftClientPool {
+public:
+	// Behaves like a Thrift Client (see operator->), but returns itself to a
+	// client pool when destroyed.
+	class Entry {
+	public:
+		Entry(ThriftClientPool& pool, std::unique_ptr<Client> client)
+				: pool_(pool),
+				  client_(std::move(client)) {
+		}
+
+		Entry(Entry&& other)
+				: pool_(other.pool_),
+				  client_(std::move(other.client_)) {
+		}
+
+		~Entry() {
+			if (client_ != nullptr) {
+				pool_.put(std::move(client_));
+			}
+		}
+
+		// Marks client as unusable (eg. after losing a connection).
+		// Prevents it from being returned to the pool.
+		void markAsUnusable() {
+			client_.reset();
+		}
+
+		Client* operator->() {
+			return client_.get();
+		}
+
+	private:
+		std::unique_ptr<Client> client_;
+		ThriftClientPool& pool_;
+	};
+
+	ThriftClientPool(int maxSize) : maxSize_(maxSize), host_("localhost"), port_(9090) { }
+
+	void setHost(std::string host) {
+		host_ = std::move(host);
+	}
+
+	void setPort(int port) {
+		port_ = port;
+	}
+
+	// Adds a new client to the pool. It will be returned back on destruction.
+	void put(std::unique_ptr<Client> client) {
+		std::unique_lock<std::mutex> lock(mutex_);
+		clients_.push_back(std::move(client));
+	}
+
+	// Gets a client from the pool or creates a new client if the pool is empty
+	Entry get() {
+		using namespace apache::thrift;
+		using namespace apache::thrift::protocol;
+		using namespace apache::thrift::transport;
+
+		std::unique_lock<std::mutex> lock(mutex_);
+		while (clients_.size() > maxSize_) {
+			clients_.pop_front();
+		}
+		if (clients_.empty()) {
+			lock.unlock();
+			// No clients in the pool; create a new connection
+			fprintf(stderr, "Opening a new connection to %s:%d\n", host_.c_str(), port_);
+			auto socket = boost::make_shared<TSocket>(host_, port_);
+			auto transport = TBufferedTransportFactory().getTransport(socket);
+			auto protocol  = TBinaryProtocolFactory().getProtocol(transport);
+			auto client = std::unique_ptr<Client>(new Client(protocol));
+			socket->setNoDelay(true);
+			transport->open();
+			return Entry(*this, std::move(client));
+		}
+		// Take the first one form the pool
+		Entry entry(*this, std::move(clients_.front()));
+		clients_.pop_front();
+		return entry;
+	}
+
+private:
+	int maxSize_;
+	std::string host_;
+	int port_;
+	std::mutex mutex_;
+	std::list<std::unique_ptr<Client>> clients_;
+};
+
+ThriftClientPool<PolonaiseClient> gClientPool(30);
 static SessionId gSessionId;
 
+// Obtains session ID. Returns true iff successful.
 bool polonaise_init() {
-	using namespace apache::thrift;
-	using namespace apache::thrift::protocol;
-	using namespace apache::thrift::transport;
-
 	try {
-		auto socket = boost::make_shared<TSocket>(gHostname, gPort);
-		gThriftTransport = TBufferedTransportFactory().getTransport(socket);
-		auto protocol = TBinaryProtocolFactory().getProtocol(gThriftTransport);
-		gPolonaiseClient = boost::make_shared<PolonaiseClient>(protocol);
-		gThriftTransport->open();
-		gSessionId = gPolonaiseClient->initSession();
+		gSessionId = gClientPool.get()->initSession();
 		return true;
-	} catch (apache::thrift::TException &tx) {
+	} catch (apache::thrift::TException& tx) {
 		fprintf(stderr, "ERROR: %s\n", tx.what());
 		return false;
 	}
 }
 
 void polonaise_term() {
-	try {
-		gThriftTransport->close();
-	} catch (apache::thrift::TException &tx) {
-		fprintf(stderr, "ERROR: %s\n", tx.what());
-	}
 }
 
 // FUSE to Polonaise conversions
@@ -277,18 +354,27 @@ int make_error_number(StatusCode::type status) {
 
 // Implementation of FUSE callbacks
 
-#define HANDLE_POLONAISE_EXCEPTION_BEGIN try {
+#define HANDLE_POLONAISE_EXCEPTION_BEGIN \
+	try { \
+		auto polonaiseClient = gClientPool.get(); \
+		try {
+
 #define HANDLE_POLONAISE_EXCEPTION_END \
-	} catch (Status& s) { \
-		fuse_reply_err(req, make_error_number(s.statusCode)); \
-	} catch (Failure& f) { \
-		fprintf(stderr, "(%s) failure: %s\n", __FUNCTION__, f.message.c_str()); \
-		fuse_reply_err(req, EIO); \
-	} catch (apache::thrift::TException& e) { \
+		} catch (Status& s) { \
+			fuse_reply_err(req, make_error_number(s.statusCode)); \
+		} catch (Failure& f) { \
+			fprintf(stderr, "(%s) failure: %s\n", __FUNCTION__, f.message.c_str()); \
+			fuse_reply_err(req, EIO); \
+		} catch (apache::thrift::TException& e) { \
+			fprintf(stderr, "(%s) connection error: %s\n", __FUNCTION__, e.what()); \
+			fuse_reply_err(req, EIO); \
+			polonaiseClient.markAsUnusable(); \
+		} \
+	} catch (apache::thrift::TException& e) /* gClientPool.get() may throw this */ { \
 		fprintf(stderr, "(%s) connection error: %s\n", __FUNCTION__, e.what()); \
 		fuse_reply_err(req, EIO); \
-		polonaise_init(); \
 	}
+
 
 void do_init(void *userdata, struct fuse_conn_info *conn) {
 	conn->want |= FUSE_CAP_DONT_MASK;
@@ -298,7 +384,7 @@ void do_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	AttributesReply reply;
-	gPolonaiseClient->getattr(reply, get_context(req), ino, get_descriptor(fi));
+	polonaiseClient->getattr(reply, get_context(req), ino, get_descriptor(fi));
 	const struct stat stbuf = make_stbuf(reply.attributes);
 	fuse_reply_attr(req, &stbuf, reply.attributesTimeout);
 
@@ -308,7 +394,7 @@ void do_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 void do_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	Descriptor descriptor = gPolonaiseClient->opendir(get_context(req), ino);
+	Descriptor descriptor = polonaiseClient->opendir(get_context(req), ino);
 	fi->fh = static_cast<uint64_t>(descriptor);
 	fuse_reply_open(req, fi);
 
@@ -320,7 +406,7 @@ void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	std::vector<DirectoryEntry> reply;
-	gPolonaiseClient->readdir(reply, get_context(req), ino, off, 1 + size / 32, get_descriptor(fi));
+	polonaiseClient->readdir(reply, get_context(req), ino, off, 1 + size / 32, get_descriptor(fi));
 	char buffer[65536];
 	if (size > 65536) {
 		size = 65536;
@@ -344,7 +430,7 @@ void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 void do_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->releasedir(get_context(req), ino, get_descriptor(fi));
+	polonaiseClient->releasedir(get_context(req), ino, get_descriptor(fi));
 	fi->fh = static_cast<uint64_t>(-2);
 	fuse_reply_err(req, 0);
 
@@ -355,7 +441,7 @@ void do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	EntryReply reply;
-	gPolonaiseClient->lookup(reply, get_context(req), parent, name);
+	polonaiseClient->lookup(reply, get_context(req), parent, name);
 	const fuse_entry_param fep = make_fuse_entry_param(reply);
 	fuse_reply_entry(req, &fep);
 
@@ -365,7 +451,7 @@ void do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
 void do_access(fuse_req_t req, fuse_ino_t ino, int mask) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->access(get_context(req), ino, get_access_mask(mask));
+	polonaiseClient->access(get_context(req), ino, get_access_mask(mask));
 	fuse_reply_err(req, 0);
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -375,13 +461,13 @@ void do_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	OpenReply reply;
-	gPolonaiseClient->open(reply, get_context(req), ino, get_open_flags(fi->flags));
+	polonaiseClient->open(reply, get_context(req), ino, get_open_flags(fi->flags));
 	fi->direct_io = reply.directIo;
 	fi->keep_cache = reply.keepCache;
 	fi->nonseekable = reply.nonSeekable;
 	fi->fh = static_cast<uint64_t>(reply.descriptor);
 	if (fuse_reply_open(req, fi) == -ENONET) {
-		gPolonaiseClient->release(get_context(req), ino, reply.descriptor);
+		polonaiseClient->release(get_context(req), ino, reply.descriptor);
 		fi->fh = static_cast<uint64_t>(-2);
 	}
 
@@ -392,7 +478,7 @@ void do_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	std::string buffer;
-	gPolonaiseClient->read(buffer, get_context(req), ino, off, size, get_descriptor(fi));
+	polonaiseClient->read(buffer, get_context(req), ino, off, size, get_descriptor(fi));
 	fuse_reply_buf(req, buffer.data(), buffer.size());
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -401,7 +487,7 @@ void do_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse
 void do_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->flush(get_context(req), ino, get_descriptor(fi));
+	polonaiseClient->flush(get_context(req), ino, get_descriptor(fi));
 	fuse_reply_err(req, 0);
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -410,7 +496,7 @@ void do_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 void do_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->release(get_context(req), ino, get_descriptor(fi));
+	polonaiseClient->release(get_context(req), ino, get_descriptor(fi));
 	fi->fh = static_cast<uint64_t>(-2);
 	fuse_reply_err(req, 0);
 
@@ -421,7 +507,7 @@ void do_statfs(fuse_req_t req, fuse_ino_t ino) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	StatFsReply reply;
-	gPolonaiseClient->statfs(reply, get_context(req), ino);
+	polonaiseClient->statfs(reply, get_context(req), ino);
 	struct statvfs s;
 	s.f_fsid = reply.filesystemId;
 	s.f_namemax = reply.maxNameLength;
@@ -441,7 +527,7 @@ void do_symlink(fuse_req_t req, const char *link, fuse_ino_t parent, const char 
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	EntryReply reply;
-	gPolonaiseClient->symlink(reply, get_context(req), link, parent, name);
+	polonaiseClient->symlink(reply, get_context(req), link, parent, name);
 	const fuse_entry_param fep = make_fuse_entry_param(reply);
 	fuse_reply_entry(req, &fep);
 
@@ -452,7 +538,7 @@ void do_readlink(fuse_req_t req, fuse_ino_t ino) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	std::string reply;
-	gPolonaiseClient->readlink(reply, get_context(req), ino);
+	polonaiseClient->readlink(reply, get_context(req), ino);
 	fuse_reply_readlink(req, reply.c_str());
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -462,7 +548,7 @@ void do_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	std::string data(buf, size);
-	int64_t count = gPolonaiseClient->write(get_context(req), ino, off, size, data, get_descriptor(fi));
+	int64_t count = polonaiseClient->write(get_context(req), ino, off, size, data, get_descriptor(fi));
 	fuse_reply_write(req, count);
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -471,7 +557,7 @@ void do_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_
 void do_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->fsync(get_context(req), ino, datasync, get_descriptor(fi));
+	polonaiseClient->fsync(get_context(req), ino, datasync, get_descriptor(fi));
 	fuse_reply_err(req, 0);
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -502,7 +588,7 @@ void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, s
 	attributes.mtime = (toSet & ToSet::kMtime) ? attr->st_mtime : 0;
 
 	AttributesReply reply;
-	gPolonaiseClient->setattr(reply, get_context(req), ino, attributes, toSet, get_descriptor(fi));
+	polonaiseClient->setattr(reply, get_context(req), ino, attributes, toSet, get_descriptor(fi));
 	const struct stat stbuf = make_stbuf(reply.attributes);
 	fuse_reply_attr(req, &stbuf, reply.attributesTimeout);
 
@@ -513,7 +599,7 @@ void do_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	CreateReply reply;
-	gPolonaiseClient->create(reply, get_context(req), parent, name, get_mode(mode), get_open_flags(fi->flags));
+	polonaiseClient->create(reply, get_context(req), parent, name, get_mode(mode), get_open_flags(fi->flags));
 	const fuse_entry_param fep = make_fuse_entry_param(reply.entry);
 	fi->fh = static_cast<uint64_t>(reply.descriptor);
 	fi->direct_io = reply.directIo;
@@ -527,7 +613,7 @@ void do_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, 
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	EntryReply reply;
-	gPolonaiseClient->mknod(reply, get_context(req), parent, name, get_file_type(mode), get_mode(mode), rdev);
+	polonaiseClient->mknod(reply, get_context(req), parent, name, get_file_type(mode), get_mode(mode), rdev);
 	const fuse_entry_param fep = make_fuse_entry_param(reply);
 	fuse_reply_entry(req, &fep);
 
@@ -538,7 +624,7 @@ void do_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode) 
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	EntryReply reply;
-	gPolonaiseClient->mkdir(reply, get_context(req), parent, name, FileType::kDirectory, get_mode(mode));
+	polonaiseClient->mkdir(reply, get_context(req), parent, name, FileType::kDirectory, get_mode(mode));
 	const fuse_entry_param fep = make_fuse_entry_param(reply);
 	fuse_reply_entry(req, &fep);
 
@@ -548,7 +634,7 @@ void do_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode) 
 void do_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->rmdir(get_context(req), parent, name);
+	polonaiseClient->rmdir(get_context(req), parent, name);
 	fuse_reply_err(req, 0);
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -558,7 +644,7 @@ void do_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *n
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
 	EntryReply reply;
-	gPolonaiseClient->link(reply, get_context(req), ino, newparent, newname);
+	polonaiseClient->link(reply, get_context(req), ino, newparent, newname);
 	const fuse_entry_param fep = make_fuse_entry_param(reply);
 	fuse_reply_entry(req, &fep);
 
@@ -568,7 +654,7 @@ void do_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *n
 void do_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->unlink(get_context(req), parent, name);
+	polonaiseClient->unlink(get_context(req), parent, name);
 	fuse_reply_err(req, 0);
 
 	HANDLE_POLONAISE_EXCEPTION_END
@@ -577,15 +663,15 @@ void do_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
 void do_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent, const char *newname) {
 	HANDLE_POLONAISE_EXCEPTION_BEGIN
 
-	gPolonaiseClient->rename(get_context(req), parent, name, newparent, newname);
+	polonaiseClient->rename(get_context(req), parent, name, newparent, newname);
 	fuse_reply_err(req, 0);
 
 	HANDLE_POLONAISE_EXCEPTION_END
 }
 
 int main(int argc, char** argv) {
-	gHostname = (getenv("POLONAISE_SERVER") ? getenv("POLONAISE_SERVER") : "localhost");
-	gPort = (getenv("POLONAISE_PORT") ? atoi(getenv("POLONAISE_PORT")) : 9090);
+	gClientPool.setHost(getenv("POLONAISE_SERVER") ? getenv("POLONAISE_SERVER") : "localhost");
+	gClientPool.setPort(getenv("POLONAISE_PORT") ? atoi(getenv("POLONAISE_PORT")) : 9090);
 	if (!polonaise_init()) {
 		fprintf(stderr, "Server connection failed.\n");
 		return 1;
@@ -617,7 +703,8 @@ int main(int argc, char** argv) {
 	ops.rename = do_rename;
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	char *mp;
-	if (fuse_parse_cmdline(&args, &mp, NULL, NULL) < 0) {
+	int mt;
+	if (fuse_parse_cmdline(&args, &mp, &mt, NULL) < 0) {
 		perror("fuse_parse_cmdline");
 		return 1;
 	}
@@ -633,7 +720,11 @@ int main(int argc, char** argv) {
 	}
 	fuse_session_add_chan(session, channel);
 	fuse_set_signal_handlers(session);
-	fuse_session_loop(session);
+	if (mt) {
+		fuse_session_loop_mt(session);
+	} else {
+		fuse_session_loop(session);
+	}
 	fuse_remove_signal_handlers(session);
 	return 0;
 }
