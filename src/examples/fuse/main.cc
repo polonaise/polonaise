@@ -105,8 +105,8 @@ public:
 			// No clients in the pool; create a new connection
 			fprintf(stderr, "Opening a new connection to %s:%d\n", host_.c_str(), port_);
 			auto socket = boost::make_shared<TSocket>(host_, port_);
-			auto transport = TBufferedTransportFactory().getTransport(socket);
-			auto protocol  = TBinaryProtocolFactory().getProtocol(transport);
+			auto transport = boost::make_shared<TBufferedTransport>(socket, 512 * 1024, 4096);
+			auto protocol  = boost::make_shared<TBinaryProtocol>(transport);
 			auto client = std::unique_ptr<Client>(new Client(protocol));
 			socket->setNoDelay(true);
 			transport->open();
