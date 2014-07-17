@@ -289,7 +289,7 @@ struct stat make_stbuf(const FileStat& fs) {
 	stbuf.st_blocks = fs.blocks;
 	stbuf.st_blksize = fs.blockSize;
 	stbuf.st_atime = fs.atime;
-	stbuf.st_mtime = fs.ctime;
+	stbuf.st_mtime = fs.mtime;
 	stbuf.st_ctime = fs.ctime;
 #ifdef HAVE_STRUCT_STAT_ST_BIRTHTIME
 	stbuf.st_birthtime = stbuf.st_ctime;
