@@ -47,6 +47,7 @@ enum StatusCode {
 	kETIMEDOUT = 37,
 	kETXTBSY = 38,
 	kEXDEV = 39,
+	kEDQUOT = 40,
 }
 
 enum FileType {

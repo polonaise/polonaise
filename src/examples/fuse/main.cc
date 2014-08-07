@@ -348,6 +348,7 @@ int make_error_number(StatusCode::type status) {
 		case StatusCode::kETIMEDOUT: return ETIMEDOUT;
 		case StatusCode::kETXTBSY: return ETXTBSY;
 		case StatusCode::kEXDEV: return EXDEV;
+		case StatusCode::kEDQUOT: return EDQUOT;
 	}
 	return EIO;
 }
